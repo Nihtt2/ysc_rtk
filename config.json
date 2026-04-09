@@ -1,0 +1,14 @@
+{
+  "android_host": "192.168.144.50",
+  "ws_port": 8888,
+  "api_port": 8080,
+  "odom_http_port": 8091,
+  "route_persistence_enabled": true,
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "robot",
+    "password": "12345678",
+    "database": "robot_routes"
+  }
+}
