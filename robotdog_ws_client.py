@@ -33,7 +33,13 @@ from ysc.db import (
 )
 
 
-CONFIG_PATH = "config.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TMP_DIR = os.path.join(BASE_DIR, "tmp")
+
+# 固定到脚本所在目录，避免从其他 cwd 启动时相对路径漂移。
+os.chdir(BASE_DIR)
+
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 # 向前端推送状态的时间间隔（秒）
 STATUS_PUSH_INTERVAL = 5.0
@@ -100,15 +106,15 @@ OPEN_TIMEOUT_SECONDS = 10
 
 
 # ================= ZED 导航脚本配置 =================
-# 注意：以下路径和命令需要根据你在 Linux 上的实际环境修改
+# 注意：以下命令需要根据你在 Linux 上的实际环境修改
 CONDA_ACTIVATE_CMD = "source ~/anaconda3/bin/activate && conda activate unitree"
-ZED_SCRIPT_PATH = "rtk_cors_4g.py"  # 修改成 zed_rtk_move.py 在机器人上的实际绝对路径或 ~ 路径
-WAYPOINTS_FILE = "tmp/robotdog_turning_waypoints.json"
+ZED_SCRIPT_PATH = os.path.join(BASE_DIR, "rtk_cors_4g.py")
+WAYPOINTS_FILE = os.path.join(TMP_DIR, "robotdog_turning_waypoints.json")
 
 # ================= 导航控制 =================
 # 通过这些文件与导航进程通信，实现暂停/继续/返航等控制
-PAUSE_STATE_FILE = "tmp/robotdog_nav_pause_state.json"
-NAV_STATE_FILE = "tmp/robotdog_nav_state.json"
+PAUSE_STATE_FILE = os.path.join(TMP_DIR, "robotdog_nav_pause_state.json")
+NAV_STATE_FILE = os.path.join(TMP_DIR, "robotdog_nav_state.json")
 
 
 # ================= 全局状态 =================
@@ -118,6 +124,10 @@ _zed_process = None
 _zed_process_lock = threading.Lock()
 _ws_app_ref = None        # 当前活跃的 WebSocketApp 实例
 _ws_app_ref_lock = threading.Lock()
+
+
+def _ensure_runtime_dirs():
+    os.makedirs(TMP_DIR, exist_ok=True)
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
@@ -358,7 +368,8 @@ def _build_navigation_command(resume_active=False, waypoint_file=None):
     if resume_active:
         cmd += " --resume-active"
     elif waypoint_file:
-        cmd += f" --waypoint-file {shlex.quote(waypoint_file)}"
+        # rtk_cors_4g.py 当前使用位置参数接收航点文件
+        cmd += f" {shlex.quote(waypoint_file)}"
     return f"{CONDA_ACTIVATE_CMD} && {cmd}"
 
 
@@ -388,6 +399,7 @@ def _launch_zed_navigation_process(resume_active=False, waypoint_file=None, reas
             # 使用 bash -lc 以便支持 source / conda 等 shell 命令
             _zed_process = subprocess.Popen(
                 ["bash", "-lc", cmd],
+                cwd=BASE_DIR,
                 stdout=None,
                 stderr=None,
             )
@@ -440,14 +452,11 @@ def _handle_robotdog_task_turning(payload):
         print(f"[WS] RobotDogTaskTurning 数据为空或格式错误，raw={data_raw!r}")
         return
 
-    # 确保目录存在
-    waypoints_dir = os.path.dirname(WAYPOINTS_FILE)
-    if waypoints_dir and not os.path.exists(waypoints_dir):
-        try:
-            os.makedirs(waypoints_dir, exist_ok=True)
-        except Exception as exc:
-            print(f"[WS] 创建航点目录失败: {exc}")
-            return
+    try:
+        _ensure_runtime_dirs()
+    except Exception as exc:
+        print(f"[WS] 创建运行目录失败: {exc}")
+        return
 
     try:
         with open(WAYPOINTS_FILE, "w", encoding="utf-8") as f:
@@ -776,6 +785,8 @@ def task_status_http_server():
 
 
 if __name__ == "__main__":
+    _ensure_runtime_dirs()
+
     ws_thread = threading.Thread(target=task_websocket, daemon=True)
     ws_thread.start()
 
