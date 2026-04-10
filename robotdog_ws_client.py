@@ -24,9 +24,7 @@ import websocket
 import http.server
 import socketserver
 
-from unitree_charge import battery_monitor, init_battery
-
-from unitree_db.route_db import (
+from ysc.db import (
     load_persistence_settings,
     upsert_route_and_waypoints,
     normalized_waypoint_rows_from_turning_data,
@@ -41,25 +39,23 @@ CONFIG_PATH = "config.json"
 STATUS_PUSH_INTERVAL = 5.0
 
 
-def _load_odom_http_port():
+def _load_status_http_port():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return int(json.load(f).get("odom_http_port", 8091))
+            cfg = json.load(f)
+        return int(cfg.get("status_http_port", cfg.get("odom_http_port", 8091)))
     except Exception:
         return 8091
 
 
-ODOM_HTTP_PORT = _load_odom_http_port()
+STATUS_HTTP_PORT = _load_status_http_port()
 
 
 # ================= 机器狗状态 =================
 class Status:
-    """机器狗当前状态，通过 WebSocket 定期推送给前端。"""
+    """机器狗当前 RTK/导航状态，通过 WebSocket 定期推送给前端。"""
 
     def __init__(self):
-        self.soc: int = None  # 电池电量百分比
-        self.odom_speed: float = 0.0  # 里程计速度(m/s)
-        self.odom_distance: float = 0.0  # 里程计路程(m)
         # RTK+导航（由 rtk_cors_4g.py POST /robotdog/rtk 更新：lon/lat/quality/timestamp/heading）
         self.rtk_lon = None
         self.rtk_lat = None
@@ -69,9 +65,6 @@ class Status:
 
     def to_dict(self):
         return {
-            "soc": self.soc,
-            "odom_speed": self.odom_speed,
-            "odom_distance": self.odom_distance,
             "lon": self.rtk_lon,
             "lat": self.rtk_lat,
             "quality": self.rtk_quality,
@@ -132,12 +125,9 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 class RobotdogHTTPHandler(http.server.BaseHTTPRequestHandler):
-    """本地 HTTP：POST /robotdog/odom（里程计）、POST /robotdog/rtk（RTK+导航状态）。"""
+    """本地 HTTP：POST /robotdog/rtk（RTK+导航状态）。"""
 
     def do_POST(self):
-        if self.path == "/robotdog/odom":
-            self._handle_odom()
-            return
         if self.path == "/robotdog/rtk":
             self._handle_rtk()
             return
@@ -161,23 +151,6 @@ class RobotdogHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(resp)))
         self.end_headers()
         self.wfile.write(resp)
-
-    def _handle_odom(self):
-        payload = self._read_json_body()
-        if not isinstance(payload, dict):
-            self.send_error(400, "Bad Request")
-            return
-        try:
-            linear_speed = float(payload.get("odom_speed", payload.get("linear_speed", 0.0)))
-            total_mileage = float(payload.get("odom_distance", payload.get("total_mileage", 0.0)))
-        except Exception:
-            self.send_error(400, "Bad Request")
-            return
-
-        with _status_lock:
-            _status.odom_speed = linear_speed
-            _status.odom_distance = total_mileage
-        self._send_ok()
 
     def _handle_rtk(self):
         payload = self._read_json_body()
@@ -770,9 +743,7 @@ def task_status_push():
     while not stop_event.is_set():
         time.sleep(STATUS_PUSH_INTERVAL)
 
-        # 从电量监控实例读取最新 SOC
         with _status_lock:
-            _status.soc = battery_monitor.soc
             status_data = _status.to_dict()
 
         with _ws_app_ref_lock:
@@ -792,43 +763,27 @@ def task_status_push():
             print(f"[STATUS] 推送状态失败: {exc}")
 
 
-def task_odom_http_server():
-    """本地 HTTP 服务：接收 odom、RTK 状态（供 WebSocket status 推送）。"""
-    server = ThreadingHTTPServer(("0.0.0.0", ODOM_HTTP_PORT), RobotdogHTTPHandler)
+def task_status_http_server():
+    """本地 HTTP 服务：接收 RTK 状态（供 WebSocket status 推送）。"""
+    server = ThreadingHTTPServer(("0.0.0.0", STATUS_HTTP_PORT), RobotdogHTTPHandler)
     print(
-        f"[HTTP] 本地服务已启动: 0.0.0.0:{ODOM_HTTP_PORT} "
-        f"POST /robotdog/odom | POST /robotdog/rtk"
+        f"[HTTP] 本地服务已启动: 0.0.0.0:{STATUS_HTTP_PORT} "
+        f"POST /robotdog/rtk"
     )
     while not stop_event.is_set():
         server.handle_request()
     server.server_close()
 
 
-# ================= 主程序 =================
-def _load_network_interface():
-    """从 config.json 读取网卡名称，默认 eno1。"""
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        return cfg.get("network_interface", "eno1")
-    except Exception:
-        return "eno1"
-
-
 if __name__ == "__main__":
-    # 初始化电量订阅（DDS 频道只需初始化一次）
-    netif = _load_network_interface()
-    init_battery(netif)
-    print(f"[BATTERY] 电量订阅已启动，网卡: {netif}")
-
     ws_thread = threading.Thread(target=task_websocket, daemon=True)
     ws_thread.start()
 
     status_thread = threading.Thread(target=task_status_push, daemon=True)
     status_thread.start()
 
-    odom_http_thread = threading.Thread(target=task_odom_http_server, daemon=True)
-    odom_http_thread.start()
+    status_http_thread = threading.Thread(target=task_status_http_server, daemon=True)
+    status_http_thread.start()
 
     _maybe_resume_navigation_on_startup()
 

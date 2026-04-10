@@ -37,24 +37,35 @@ from nav_utils import (
     get_utm_epsg,
     compute_route_length_meters,
     parse_agrica,
-    parse_target_lonlat,
-    find_nearest_waypoint_index_lonlat,
 )
-from route_segment_planner import build_named_route, plan_route
 
 from motion import LynxM20Client
 
-from unitree_zed import cam_extrinsic
-from unitree_waypoint import Waypoint
+from ysc.zed import cam_extrinsic
+from ysc.waypoint import Waypoint
 
-from unitree_db.route_db import (
-    load_persistence_settings,
-    get_route_progress,
+from ysc.db import (
     set_route_progress,
     set_route_status,
     read_active_route_meta,
     update_active_route_meta,
     clear_active_route_meta,
+)
+from ysc.rtk_nav import (
+    MissionProgressState,
+    apply_resume_progress_from_meta as _apply_resume_progress_from_meta,
+    apply_segment_route_if_needed as _apply_segment_route_if_needed,
+    apply_stored_route_progress as _apply_stored_route_progress,
+    build_long_distance_checkpoints as _build_long_distance_checkpoints,
+    compute_quadratic_approach_speed as _compute_quadratic_approach_speed,
+    configure_target_pause as _configure_target_pause,
+    is_navigation_paused as _is_navigation_paused,
+    load_android_api_config,
+    load_rtk_status_push_url,
+    load_waypoints_from_file as _load_waypoints_from_file,
+    route_persistence_enabled as _route_persistence_enabled,
+    run_waypoint_action_if_needed as _run_waypoint_action_if_needed,
+    write_navigation_pause_state as _write_navigation_pause_state,
 )
 
 # ================= ZED 坐标约定 =================
@@ -181,16 +192,8 @@ CONFIG_PATH = "config.json"
 
 
 def _load_android_config():
-    """从 config.json 读取 Android 端 host 和 api_port(8080)，失败时回退到默认值"""
-    config_path = CONFIG_PATH
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        host = cfg.get("android_host", "10.65.42.98")
-        port = int(cfg.get("api_port", 8080))
-        return host, port
-    except Exception:
-        return "10.65.42.98", 8080
+    """从 config.json 读取 Android 端 host 和 api_port(8080)。"""
+    return load_android_api_config(CONFIG_PATH)
 
 
 _ANDROID_HOST, _API_PORT = _load_android_config()
@@ -198,8 +201,7 @@ STOP_TASK_URL    = f"http://{_ANDROID_HOST}:{_API_PORT}/api/stop-task"
 
 
 def route_persistence_enabled():
-    ok, _ = load_persistence_settings(CONFIG_PATH)
-    return ok
+    return _route_persistence_enabled(CONFIG_PATH)
 
 
 def apply_stored_route_progress():
@@ -210,117 +212,50 @@ def apply_stored_route_progress():
     """
     global current_wp_index, robot_state, active_route_id
 
-    if not active_route_id or not route_persistence_enabled():
-        return
-    if cli_point_a or cli_point_b:
-        print("[unitree_db] 已启用 A/B 分段，忽略库中进度，从索引 0 开始")
-        current_wp_index = 0
-        return
-
-    row = get_route_progress(active_route_id, CONFIG_PATH)
-    if not row:
-        current_wp_index = 0
-        return
-
-    next_idx, st = row
-    n = len(waypoints)
-    if st == "completed" or (n > 0 and next_idx >= n):
-        robot_state = STATE_IDLE
-        active_route_id = None
-        print("[unitree_db] 路线在库中已完成或进度已走完，保持待机")
-        return
-    if st != "active":
-        current_wp_index = 0
-        print(f"[unitree_db] 路线状态为 {st}，从索引 0 开始")
-        return
-
-    if n <= 0:
-        current_wp_index = 0
-        return
-    current_wp_index = min(max(0, next_idx), n - 1)
-    print(
-        f"[unitree_db] 恢复进度 current_wp_index={current_wp_index} "
-        f"(库 next_wp_index={next_idx})"
+    state = MissionProgressState(
+        current_wp_index=current_wp_index,
+        robot_state=robot_state,
+        active_route_id=active_route_id,
     )
+    _apply_stored_route_progress(
+        state,
+        len(waypoints),
+        cli_point_a=cli_point_a,
+        cli_point_b=cli_point_b,
+        config_path=CONFIG_PATH,
+        state_idle=STATE_IDLE,
+    )
+    current_wp_index = state.current_wp_index
+    robot_state = state.robot_state
+    active_route_id = state.active_route_id
 
 
 def apply_resume_progress_from_meta(resume_meta):
     """优先按 MySQL 进度恢复；不可用时回退到 active_route_meta.json 中的 next_wp_index。"""
     global current_wp_index, robot_state, active_route_id
 
-    if cli_point_a or cli_point_b:
-        print("[恢复] 已启用 A/B 分段，忽略持久化进度，从索引 0 开始")
-        current_wp_index = 0
-        return
-
-    n = len(waypoints)
-    if active_route_id and route_persistence_enabled():
-        row = get_route_progress(active_route_id, CONFIG_PATH)
-        if row:
-            next_idx, st = row
-            if st == "completed" or (n > 0 and next_idx >= n):
-                robot_state = STATE_IDLE
-                active_route_id = None
-                clear_active_route_meta()
-                print("[恢复] 路线在库中已完成或进度已走完，保持待机")
-                return
-            if st != "active":
-                robot_state = STATE_IDLE
-                active_route_id = None
-                clear_active_route_meta()
-                print(f"[恢复] 路线状态为 {st}，不自动续跑")
-                return
-            if n <= 0:
-                current_wp_index = 0
-                return
-            current_wp_index = min(max(0, next_idx), n - 1)
-            print(
-                f"[恢复] 按 MySQL 进度续跑 current_wp_index={current_wp_index} "
-                f"(库 next_wp_index={next_idx})"
-            )
-            return
-        print("[恢复] 未读取到 MySQL 进度，回退到本地恢复信息")
-
-    if not isinstance(resume_meta, dict):
-        current_wp_index = 0
-        return
-
-    try:
-        next_idx = int(resume_meta.get("next_wp_index", 0))
-    except (TypeError, ValueError):
-        next_idx = 0
-    st = str(resume_meta.get("status") or "active")
-
-    if st == "completed" or (n > 0 and next_idx >= n):
-        robot_state = STATE_IDLE
-        active_route_id = None
-        clear_active_route_meta()
-        print("[恢复] 本地恢复信息显示任务已完成，保持待机")
-        return
-    if st != "active":
-        robot_state = STATE_IDLE
-        active_route_id = None
-        clear_active_route_meta()
-        print(f"[恢复] 本地恢复状态为 {st}，不自动续跑")
-        return
-
-    if n <= 0:
-        current_wp_index = 0
-        return
-    current_wp_index = min(max(0, next_idx), n - 1)
-    print(f"[恢复] 按本地进度续跑 current_wp_index={current_wp_index}")
+    state = MissionProgressState(
+        current_wp_index=current_wp_index,
+        robot_state=robot_state,
+        active_route_id=active_route_id,
+    )
+    _apply_resume_progress_from_meta(
+        state,
+        resume_meta,
+        len(waypoints),
+        cli_point_a=cli_point_a,
+        cli_point_b=cli_point_b,
+        config_path=CONFIG_PATH,
+        state_idle=STATE_IDLE,
+    )
+    current_wp_index = state.current_wp_index
+    robot_state = state.robot_state
+    active_route_id = state.active_route_id
 
 
 def _load_rtk_status_push_url():
-    """推送到本机 robotdog_ws_client 的 HTTP 服务，与 config 中 odom_http_port 一致（默认 8091）。"""
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        host = cfg.get("rtk_status_host", "127.0.0.1")
-        port = int(cfg.get("odom_http_port", 8091))
-        return f"http://{host}:{port}/robotdog/rtk"
-    except Exception:
-        return "http://127.0.0.1:8091/robotdog/rtk"
+    """推送到本机 robotdog_ws_client 的 HTTP 服务。"""
+    return load_rtk_status_push_url(CONFIG_PATH)
 
 
 RTK_STATUS_PUSH_URL = _load_rtk_status_push_url()
@@ -775,80 +710,22 @@ def get_current_heading():
 
 
 def is_navigation_paused():
-    """
-    从 PAUSE_STATE_FILE 读取暂停状态。
-    文件形如：{"paused": true/false, "timestamp": ...}
-    """
-    try:
-        with open(PAUSE_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return bool(data.get("paused"))
-    except Exception:
-        return False
+    return _is_navigation_paused(PAUSE_STATE_FILE)
 
 
 def write_navigation_pause_state(paused, reason=None):
-    """
-    写入导航暂停状态文件，供 navigate_to() 周期读取。
-    """
-    state = {
-        "paused": bool(paused),
-        "timestamp": time.time(),
-    }
-    if reason:
-        state["reason"] = reason
-    try:
-        with open(PAUSE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-        print(f"[暂停] 已更新暂停状态 paused={bool(paused)}")
-    except Exception as exc:
-        print(f"[暂停] 写入暂停状态失败: {exc}")
-
-
-def find_nearest_waypoint_index(target_lon, target_lat):
-    """
-    根据经纬度 target 计算距离最近的航点索引（基于局部坐标）。
-    """
-    return find_nearest_waypoint_index_lonlat(
-        target_lon=target_lon,
-        target_lat=target_lat,
-        waypoints_xy=[(wp.x, wp.y) for wp in waypoints],
-        origin_utm_x=origin_utm_x,
-        origin_utm_y=origin_utm_y,
-    )
-
-
-def has_target_value(raw_target):
-    if raw_target is None:
-        return False
-    if isinstance(raw_target, str):
-        return bool(raw_target.strip())
-    if isinstance(raw_target, (list, tuple, dict, set)):
-        return len(raw_target) > 0
-    return True
+    _write_navigation_pause_state(PAUSE_STATE_FILE, paused, reason)
 
 
 def configure_target_pause(raw_target):
     """根据 raw_target 设置最近航点自动暂停逻辑，并决定是否跳过 action_type。"""
     global target_pause_wp_index, task_has_target
-
-    target_pause_wp_index = None
-    task_has_target = has_target_value(raw_target)
-    parsed_target = parse_target_lonlat(raw_target)
-    if parsed_target is None:
-        if task_has_target:
-            print("[target] target 有值但无法解析，当前任务仍按 target 模式跳过动作")
-        return
-
-    nearest_idx = find_nearest_waypoint_index(parsed_target[0], parsed_target[1])
-    if nearest_idx is not None:
-        target_pause_wp_index = nearest_idx
-        print(
-            f"[target] 已设置目标暂停航点索引: {target_pause_wp_index + 1}/{len(waypoints)}"
-        )
-        print("[target] 当前任务带 target，已禁用 action_type 动作")
-    else:
-        print("[target] 未能计算最近航点索引，但当前任务仍按 target 模式跳过动作")
+    target_pause_wp_index, task_has_target = _configure_target_pause(
+        raw_target,
+        waypoints,
+        origin_utm_x,
+        origin_utm_y,
+    )
 
 
 def apply_segment_route_if_needed(point_a=None, point_b=None, is_loop=0):
@@ -856,39 +733,16 @@ def apply_segment_route_if_needed(point_a=None, point_b=None, is_loop=0):
     当传入 A/B 外参时，按“最近点 -> A -> B”重排当前 waypoints。
     """
     global waypoints
-    if point_a is None or point_b is None:
-        return
-
-    if fused_utm_x is None or fused_utm_y is None or origin_utm_x is None or origin_utm_y is None:
-        print("[路线规划] 当前位置或原点未就绪，跳过 A->B 分段规划")
-        return
-
-    try:
-        current_xy = (fused_utm_x - origin_utm_x, fused_utm_y - origin_utm_y)
-        named_route = build_named_route(waypoints)
-        planned = plan_route(
-            current_xy=current_xy,
-            route_points=named_route,
-            point_a=point_a,
-            point_b=point_b,
-            is_loop=is_loop,
-        )
-        new_wps = []
-        for p in planned["final_points"]:
-            wp = Waypoint(name=p["name"], lon=p["lon"], lat=p["lat"],
-                          action_type=p["action_type"], time=p["time"])
-            wp.x = p["x"]
-            wp.y = p["y"]
-            new_wps.append(wp)
-        waypoints = new_wps
-        print(
-            "[路线规划] 已应用分段路线："
-            f"最近点={planned['nearest_idx'] + 1}, "
-            f"A={planned['a_idx'] + 1}, B={planned['b_idx'] + 1}, "
-            f"is_loop={int(is_loop)}, 点名序列={planned['final_names']}"
-        )
-    except Exception as exc:
-        print(f"[路线规划] 规划失败，回退原始路线: {exc}")
+    waypoints = _apply_segment_route_if_needed(
+        waypoints,
+        fused_utm_x,
+        fused_utm_y,
+        origin_utm_x,
+        origin_utm_y,
+        point_a=point_a,
+        point_b=point_b,
+        is_loop=is_loop,
+    )
 
 
 def trigger_return_mode():
@@ -1027,58 +881,25 @@ def read_nav_state():
 
 
 def compute_quadratic_approach_speed(dist):
-    """
-    按距离返回前向速度目标值：
-      - >= 2.5m：保持最高速
-      - 2.5m -> 1.5m：二次函数减速到最低巡航速度
-      - < 1.5m：保持最低巡航速度，直到到点
-    """
-    if dist <= arrival_radius:
-        return 0.0
-
-    if dist >= NAV_DECEL_START_DIST:
-        return NAV_MAX_VX
-
-    if dist >= NAV_MIN_VX_REACHED_DIST:
-        ratio = (
-            (dist - NAV_MIN_VX_REACHED_DIST)
-            / max(NAV_DECEL_START_DIST - NAV_MIN_VX_REACHED_DIST, 1e-6)
-        )
-        ratio = max(0.0, min(1.0, ratio))
-        return NAV_MIN_VX + (NAV_MAX_VX - NAV_MIN_VX) * (ratio ** 2)
-
-    return NAV_MIN_VX
+    return _compute_quadratic_approach_speed(
+        dist,
+        arrival_radius,
+        NAV_MAX_VX,
+        NAV_MIN_VX,
+        NAV_DECEL_START_DIST,
+        NAV_MIN_VX_REACHED_DIST,
+    )
 
 
 def build_long_distance_checkpoints(start_x, start_y, target_x, target_y):
-    """
-    当前点到目标点距离大于阈值时，每 5m 生成一个中间点，最后再追加真实目标点。
-    """
-    dx = target_x - start_x
-    dy = target_y - start_y
-    total_dist = math.hypot(dx, dy)
-
-    if total_dist <= NAV_LONG_SEGMENT_TRIGGER_DIST:
-        return [(target_x, target_y, False, total_dist)]
-
-    checkpoints = []
-    mid_idx = 0
-    next_dist = NAV_LONG_SEGMENT_STEP_DIST
-    while next_dist < total_dist:
-        ratio = next_dist / total_dist
-        checkpoints.append(
-            (
-                start_x + dx * ratio,
-                start_y + dy * ratio,
-                True,
-                next_dist,
-            )
-        )
-        mid_idx += 1
-        next_dist = (mid_idx + 1) * NAV_LONG_SEGMENT_STEP_DIST
-
-    checkpoints.append((target_x, target_y, False, total_dist))
-    return checkpoints
+    return _build_long_distance_checkpoints(
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+        NAV_LONG_SEGMENT_TRIGGER_DIST,
+        NAV_LONG_SEGMENT_STEP_DIST,
+    )
 
 
 def navigate_with_segment_points(target_wp, sport_client, expected_state):
@@ -1510,112 +1331,34 @@ def task_plot():
         plt.pause(0.5)
 
 
-def load_waypoints_from_file(waypoint_file):
-    """
-    从 JSON 文件加载航点，支持两种格式：
-      新格式（对象数组）：
-        [{"name":"1","lon":120.1,"lat":30.2,"action_type":0,"time":0}, ...]
-        action_type: 0 无  1 停留 time 秒  2 坐下 time 秒后起立+standard
-      旧格式（兼容）：
-        [[lon, lat], ...]
-    然后：
-      - 等待 RTK 把 origin_utm_x / origin_utm_y 设好
-      - 把每个经纬度转成 UTM，再减去原点，得到局部坐标 (x, y)
-    """
-    global waypoints, origin_utm_x, origin_utm_y
-
-    try:
-        with open(waypoint_file, "r", encoding="utf-8") as f:
-            gps_points = json.load(f)
-    except Exception as exc:
-        print(f"[航点] 读取航点文件失败 {waypoint_file}: {exc}")
-        return False
-
-    if not isinstance(gps_points, list):
-        print("[航点] 航点文件格式错误，应为数组")
-        return False
-
-    # 等待 RTK 原点就绪
+def _wait_for_origin_ready():
     while origin_utm_x is None or origin_utm_y is None:
         print("[航点] 等待 RTK 原点就绪...")
         time.sleep(0.5)
+    return origin_utm_x, origin_utm_y
 
+
+def load_waypoints_from_file(waypoint_file):
+    global waypoints
+
+    loaded_waypoints = _load_waypoints_from_file(
+        waypoint_file,
+        _wait_for_origin_ready,
+    )
+    if loaded_waypoints is None:
+        return False
     waypoints.clear()
-
-    for idx, item in enumerate(gps_points):
-        try:
-            if isinstance(item, dict):
-                # 新格式：对象
-                lon_val    = float(item["lon"])
-                lat_val    = float(item["lat"])
-                wp_name    = item.get("name", f"{idx + 1}")
-                act        = int(item.get("action_type", 0))
-                t          = float(item.get("time", 0.0))
-            else:
-                # 旧格式：[lon, lat]
-                lon_val    = float(item[0])
-                lat_val    = float(item[1])
-                wp_name    = f"{idx + 1}"
-                act        = 0
-                t          = 0.0
-        except Exception:
-            print(f"[航点] 第 {idx} 个点格式错误: {item}")
-            continue
-
-        epsg = get_utm_epsg(lon_val, lat_val)
-        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
-        utm_x, utm_y = transformer.transform(lon_val, lat_val)
-
-        x = utm_x - origin_utm_x
-        y = utm_y - origin_utm_y
-        wp = Waypoint(name=wp_name, lon=lon_val, lat=lat_val,
-                      action_type=act, time=t)
-        wp.x = x
-        wp.y = y
-        waypoints.append(wp)
-
-        print(
-            f"[航点] 已添加 {idx + 1}: "
-            f"lat={lat_val:.6f}, lon={lon_val:.6f} -> "
-            f"(x={x:.2f}, y={y:.2f})  name={wp_name}  action={act}  time={t}"
-        )
-
-    print(f"[航点] 共加载 {len(waypoints)} 个航点")
+    waypoints.extend(loaded_waypoints)
     return len(waypoints) > 0
 
 
-def _waypoint_action_sit_then_stand(sport_client, wp):
-    """
-    action_type==2：调用 sit（坐下）-> 保持 wp.time 秒 -> stand（起立）-> standard。
-    """
-    dur = max(0.0, float(wp.time))
-    print(
-        f"[动作] 航点 '{wp.name}' 坐下，保持 {dur} 秒后起立并 standard"
-    )
-    sport_client.stop()
-    time.sleep(0.15)
-    sport_client.sit()
-    if dur > 0:
-        time.sleep(dur)
-    else:
-        time.sleep(0.3)
-    sport_client.stand()
-    time.sleep(0.25)
-    sport_client.standard()
-
-
 def run_waypoint_action_if_needed(sport_client, wp, scope_label):
-    if task_has_target:
-        if wp.action_type in (1, 2):
-            print(f"[动作] {scope_label} '{wp.name}' 检测到 target，跳过 action_type={wp.action_type}")
-        return
-
-    if wp.action_type == 1 and wp.time > 0:
-        print(f"[动作] {scope_label} '{wp.name}' 停留 {wp.time} 秒")
-        time.sleep(wp.time)
-    elif wp.action_type == 2:
-        time.sleep(1)
-        _waypoint_action_sit_then_stand(sport_client, wp)
+    _run_waypoint_action_if_needed(
+        sport_client,
+        wp,
+        scope_label,
+        task_has_target,
+    )
 
 
 def run_navigation_loop(sport_client):

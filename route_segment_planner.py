@@ -9,7 +9,7 @@
 
 import math
 from nav_utils import find_nearest_waypoint_index_xy
-from unitree_waypoint import Waypoint
+from ysc.waypoint import Waypoint
 
 
 def build_named_route(waypoints):
